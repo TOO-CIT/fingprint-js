@@ -3,8 +3,32 @@ name: JS · Publish npm
 on:
   workflow_dispatch:
     inputs:
-      artifact_id:
-        description: Private npm handoff artifact ID
+      agent:
+        description: Base64-encoded agent.tgz
+        required: true
+        type: string
+      react:
+        description: Base64-encoded react.tgz
+        required: true
+        type: string
+      vue:
+        description: Base64-encoded vue.tgz
+        required: true
+        type: string
+      source_run_id:
+        description: Source release workflow run ID
+        required: true
+        type: string
+      source_run_attempt:
+        description: Source release workflow run attempt
+        required: true
+        type: string
+      source_sha:
+        description: Source release commit SHA
+        required: true
+        type: string
+      sha256:
+        description: Colon-separated SHA-256 digests for agent, react and vue
         required: true
         type: string
 
@@ -15,22 +39,29 @@ concurrency:
 jobs:
   publish:
     name: Publish npm
-    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: production
     permissions:
       id-token: write
     steps:
+      - name: Authorize publisher dispatch
+        run: |
+          set -euo pipefail
+          # Account ID of fingprint-js-release[bot].
+          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch || "$GITHUB_REF" != refs/heads/main ||
+                "$GITHUB_ACTOR_ID" != 361032127 || "$GITHUB_RUN_ATTEMPT" != 1 ]]; then
+            echo "::error::Expected a new dispatch on main from the release GitHub App"
+            exit 1
+          fi
+
       - name: Resolve private handoff source
         id: source
         env:
           SOURCE_REPOSITORY: ${{ secrets.JS_SOURCE_REPOSITORY }}
-          ARTIFACT_ID: ${{ inputs.artifact_id }}
         run: |
           set -euo pipefail
           [[ "$SOURCE_REPOSITORY" =~ ^[a-zA-Z0-9-]+/[a-zA-Z0-9_.-]+$ ]]
-          [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]]
           owner=${SOURCE_REPOSITORY%/*}
           repo=${SOURCE_REPOSITORY#*/}
           echo "::add-mask::$owner"
@@ -47,29 +78,43 @@ jobs:
           permission-actions: read
 
       - name: Authorize source workflow run
-        id: handoff
         env:
           GH_TOKEN: ${{ steps.reader.outputs.token }}
           SOURCE_REPOSITORY: ${{ secrets.JS_SOURCE_REPOSITORY }}
-          ARTIFACT_ID: ${{ inputs.artifact_id }}
         run: |
           set -euo pipefail
-          artifact=$(gh api "repos/$SOURCE_REPOSITORY/actions/artifacts/$ARTIFACT_ID")
-          run_id=$(jq -er 'select(.expired == false and (.name | test("^npm-packages-[0-9]+$"))) | .workflow_run.id | numbers' <<< "$artifact")
-          gh api "repos/$SOURCE_REPOSITORY/actions/runs/$run_id" |
-            jq -e --arg repo "$SOURCE_REPOSITORY" '
+          run_id=$(jq -er '.inputs.source_run_id | strings | select(test("^[1-9][0-9]*$"))' "$GITHUB_EVENT_PATH")
+          attempt=$(jq -er '.inputs.source_run_attempt | strings | select(test("^[1-9][0-9]*$"))' "$GITHUB_EVENT_PATH")
+          sha=$(jq -er '.inputs.source_sha | strings | select(test("^[0-9a-f]{40}$"))' "$GITHUB_EVENT_PATH")
+          if ! gh api "repos/$SOURCE_REPOSITORY/actions/runs/$run_id/attempts/$attempt" |
+            jq -e --arg repo "$SOURCE_REPOSITORY" --arg id "$run_id" --arg attempt "$attempt" --arg sha "$sha" '
               .path == ".github/workflows/release.yml" and .event == "push" and
-              .head_branch == "main" and .head_repository.full_name == $repo
-            ' > /dev/null
-          echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
+              .head_branch == "main" and .head_repository.full_name == $repo and
+              (.id | tostring) == $id and (.run_attempt | tostring) == $attempt and
+              .head_sha == $sha
+            ' > /dev/null; then
+            echo "::error::Dispatch does not match the source release workflow run"
+            exit 1
+          fi
 
-      - uses: actions/download-artifact@v5
-        with:
-          artifact-ids: ${{ inputs.artifact_id }}
-          github-token: ${{ steps.reader.outputs.token }}
-          repository: ${{ secrets.JS_SOURCE_REPOSITORY }}
-          run-id: ${{ steps.handoff.outputs.run-id }}
-          path: ${{ runner.temp }}/npm-handoff
+      - name: Restore npm handoff
+        run: |
+          set -euo pipefail
+          mkdir -- "$RUNNER_TEMP/npm-handoff"
+          cd -- "$RUNNER_TEMP/npm-handoff"
+          for name in agent react vue; do
+            if ! jq -er --arg name "$name" '.inputs[$name] | strings | select(length > 0)' "$GITHUB_EVENT_PATH" |
+              base64 -d > "$name.tgz"; then
+              echo "::error::Missing or invalid npm handoff archive: $name.tgz"
+              exit 1
+            fi
+          done
+          expected=$(jq -er '.inputs.sha256 | strings' "$GITHUB_EVENT_PATH")
+          actual=$(sha256sum agent.tgz react.tgz vue.tgz | cut -d ' ' -f 1 | paste -sd : -)
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::npm handoff checksum mismatch"
+            exit 1
+          fi
 
       - uses: actions/setup-node@v4
         with:
