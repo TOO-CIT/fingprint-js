@@ -1,0 +1,111 @@
+name: JS · Publish npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_id:
+        description: Private npm handoff artifact ID
+        required: true
+        type: string
+
+concurrency:
+  group: publish-npm
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish npm
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    permissions:
+      id-token: write
+    steps:
+      - name: Resolve private handoff source
+        id: source
+        env:
+          SOURCE_REPOSITORY: ${{ secrets.JS_SOURCE_REPOSITORY }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REPOSITORY" =~ ^[a-zA-Z0-9-]+/[a-zA-Z0-9_.-]+$ ]]
+          [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]]
+          owner=${SOURCE_REPOSITORY%/*}
+          repo=${SOURCE_REPOSITORY#*/}
+          echo "::add-mask::$owner"
+          echo "::add-mask::$repo"
+          printf 'owner=%s\nrepo=%s\n' "$owner" "$repo" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/create-github-app-token@v3
+        id: reader
+        with:
+          client-id: ${{ vars.JS_HANDOFF_APP_CLIENT_ID }}
+          private-key: ${{ secrets.JS_HANDOFF_APP_PRIVATE_KEY }}
+          owner: ${{ steps.source.outputs.owner }}
+          repositories: ${{ steps.source.outputs.repo }}
+          permission-actions: read
+
+      - name: Authorize source workflow run
+        id: handoff
+        env:
+          GH_TOKEN: ${{ steps.reader.outputs.token }}
+          SOURCE_REPOSITORY: ${{ secrets.JS_SOURCE_REPOSITORY }}
+          ARTIFACT_ID: ${{ inputs.artifact_id }}
+        run: |
+          set -euo pipefail
+          artifact=$(gh api "repos/$SOURCE_REPOSITORY/actions/artifacts/$ARTIFACT_ID")
+          run_id=$(jq -er 'select(.expired == false and (.name | test("^npm-packages-[0-9]+$"))) | .workflow_run.id | numbers' <<< "$artifact")
+          gh api "repos/$SOURCE_REPOSITORY/actions/runs/$run_id" |
+            jq -e --arg repo "$SOURCE_REPOSITORY" '
+              .path == ".github/workflows/release.yml" and .event == "push" and
+              .head_branch == "main" and .head_repository.full_name == $repo
+            ' > /dev/null
+          echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v5
+        with:
+          artifact-ids: ${{ inputs.artifact_id }}
+          github-token: ${{ steps.reader.outputs.token }}
+          repository: ${{ secrets.JS_SOURCE_REPOSITORY }}
+          run-id: ${{ steps.handoff.outputs.run-id }}
+          path: ${{ runner.temp }}/npm-handoff
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.1'
+
+      - name: Set up npm for Trusted Publishing
+        run: npm install --global npm@11.21.3
+
+      - name: Publish missing npm versions
+        working-directory: ${{ runner.temp }}/npm-handoff
+        env:
+          NPM_CONFIG_PROVENANCE: 'false'
+        run: |
+          set -euo pipefail
+          pending=()
+          for name in agent react vue; do
+            archive="$name.tgz"
+            files=$(tar -tzf "$archive")
+            if grep -E '\.map$' <<< "$files"; then
+              echo "::error::Sourcemap found in $archive"
+              exit 1
+            fi
+            version=$(tar -xzOf "$archive" package/package.json |
+              jq -er --arg name "@fingerru/$name" '
+                select(.name == $name and .publishConfig.access == "public" and
+                  .repository.url == "git+https://github.com/TOO-CIT/fingprint-js.git") |
+                .version | select(test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
+              ')
+            status=$(curl --silent --show-error --max-time 30 --output /dev/null --write-out '%{http_code}' \
+              "https://registry.npmjs.org/@fingerru%2f$name/$version")
+            case "$status" in
+              200) echo "Already published: @fingerru/$name@$version" ;;
+              404) pending+=("$archive") ;;
+              *) echo "::error::npm registry returned HTTP $status for @fingerru/$name@$version"; exit 1 ;;
+            esac
+          done
+          for archive in "${pending[@]}"; do
+            npm publish "./$archive" --registry=https://registry.npmjs.org --access public --tag latest --ignore-scripts
+          done
